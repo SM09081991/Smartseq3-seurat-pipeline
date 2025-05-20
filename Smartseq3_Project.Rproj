@@ -156,7 +156,7 @@ FeaturePlot(seurat_combined, features = "Mitf")
 # 🔍 Subset Cells of Interest
 # ------------------------------------------
 Idents(seurat_combined) <- "FACSannotation"
-keep_cells <- c("NVFDC", "TUM", "VFDC")
+keep_cells <- c("Tcells", "Tumor", "Bcells")
 seurat_subset <- subset(seurat_combined, idents = keep_cells)
 
 DimPlot(seurat_subset, reduction = "umap", group.by = "FACSannotation", label = TRUE) +
