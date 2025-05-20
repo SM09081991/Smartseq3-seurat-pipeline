@@ -1,13 +1,167 @@
-Version: 1.0
+# 01_preprocess_smartseq3.R
+# Description: Process Smart-seq3 data from multiple folders, generate merged Seurat object, attach metadata, and run QC/clustering
+# Author: Sanket More
 
-RestoreWorkspace: Default
-SaveWorkspace: Default
-AlwaysSaveHistory: Default
 
-EnableCodeIndexing: Yes
-UseSpacesForTab: Yes
-NumSpacesForTab: 2
-Encoding: UTF-8
+# ------------------------------------------
+# 📦 Load Required Libraries
+# ------------------------------------------
+suppressPackageStartupMessages({
+  library(readr)
+  library(readxl)
+  library(stringr)
+  library(dplyr)
+  library(Matrix)
+  library(Seurat)
+  library(tidyverse)
+})
 
-RnwWeave: knitr
-LaTeX: pdfLaTeX
+# ------------------------------------------
+# 📁 Set Working Directory (relative paths)
+# ------------------------------------------
+main_dir <- "data/New_plates"          # Replace with your relative path in repo
+metadata_path <- file.path(main_dir, "250418_Sorting_Image_FACS_exclusion_corrected.xlsx")
+index_file <- file.path(main_dir, "index.txt")
+
+# ------------------------------------------
+# 📄 Load Shared Index File
+# ------------------------------------------
+index <- read_tsv(index_file)
+
+# ------------------------------------------
+# 🔁 Loop Through All Plates and Preprocess
+# ------------------------------------------
+folders <- list.dirs(path = main_dir, full.names = TRUE, recursive = FALSE)
+
+for (folder in folders) {
+  message("Processing: ", folder)
+  
+  # Load RDS count data
+  rds_path <- file.path(folder, "Smartseq3xpress.dgecounts.rds")
+  data <- readRDS(rds_path)
+  count.matrix <- data$umicount$inex$all
+  
+  # Load gene identifiers
+  identifiers_file <- list.files(path = file.path(folder, "zUMIs_output/expression/"),
+                                 pattern = "*.gene_names.txt", full.names = TRUE)
+  identifiers <- read.table(identifiers_file, header = TRUE)
+  
+  # Replace gene IDs with names
+  gene_map <- setNames(identifiers$gene_name, identifiers$gene_id)
+  rownames(count.matrix) <- sapply(rownames(count.matrix), function(id) {
+    if (!is.na(gene_map[id]) && gene_map[id] != "") gene_map[id] else id
+  })
+  rownames(count.matrix) <- make.unique(rownames(count.matrix))
+  
+  # Load barcode mapping
+  barcodefile_path <- file.path(folder, "reads_for_zUMIs.samples.txt")
+  barcodefile <- read_tsv(barcodefile_path)
+  
+  # Map barcodes to wells
+  cells <- colnames(count.matrix)
+  new_cells <- sapply(cells, function(cell) {
+    indexcode <- barcodefile$sample[barcodefile$BC == cell][1]
+    if (!is.na(indexcode)) {
+      parts <- str_split(indexcode, "_")[[1]]
+      full_index <- paste0("i7_", parts[2], "_i5_", parts[4])
+      well <- index$well[index$indexstring == full_index]
+      if (length(well) > 0) return(well) else return(cell)
+    } else {
+      return(cell)
+    }
+  })
+  colnames(count.matrix) <- new_cells
+  
+  # Save processed matrix
+  saveRDS(count.matrix, file = file.path(folder, "processed_count_matrix.rds"))
+}
+
+# ------------------------------------------
+# 🔗 Combine All Plates into One Matrix
+# ------------------------------------------
+matrix_list <- list()
+all_genes <- c()
+
+for (folder in folders) {
+  plate_id <- basename(folder)
+  mat <- readRDS(file.path(folder, "processed_count_matrix.rds"))
+  all_genes <- union(all_genes, rownames(mat))
+  matrix_list[[plate_id]] <- mat
+}
+
+aligned_list <- lapply(names(matrix_list), function(plate_id) {
+  mat <- matrix_list[[plate_id]]
+  missing_genes <- setdiff(all_genes, rownames(mat))
+  
+  if (length(missing_genes) > 0) {
+    zero_mat <- Matrix(0, nrow = length(missing_genes), ncol = ncol(mat), sparse = TRUE)
+    rownames(zero_mat) <- missing_genes
+    colnames(zero_mat) <- colnames(mat)
+    mat <- rbind(mat, zero_mat)
+  }
+  
+  mat <- mat[sort(rownames(mat)), ]
+  colnames(mat) <- paste0(plate_id, "_", colnames(mat))
+  return(mat)
+})
+
+combined_matrix <- do.call(cbind, aligned_list)
+
+# ------------------------------------------
+# 🔬 Create Seurat Object and Add Metadata
+# ------------------------------------------
+seurat_combined <- CreateSeuratObject(counts = combined_matrix, project = "Smartseq3_Combined")
+seurat_combined$plate <- sapply(strsplit(colnames(seurat_combined), "_"), `[`, 1)
+seurat_combined$well <- sapply(strsplit(colnames(seurat_combined), "_"), `[`, 2)
+
+# Add FACS/annotation metadata
+annotation <- read_excel(metadata_path)
+annotation$cell_id <- paste0(annotation$Plate, "_", annotation$Well)
+seurat_combined$cell_id <- colnames(seurat_combined)
+
+meta_combined <- left_join(seurat_combined@meta.data, annotation, by = "cell_id")
+rownames(meta_combined) <- meta_combined$cell_id
+seurat_combined@meta.data <- meta_combined
+
+# ------------------------------------------
+# 📊 QC and Normalization
+# ------------------------------------------
+seurat_combined[["percent.mt"]] <- PercentageFeatureSet(seurat_combined, pattern = "^mt-")
+
+VlnPlot(seurat_combined, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0.1)
+
+# Filter cells
+seurat_combined <- subset(seurat_combined, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 20)
+
+# Normalize and scale
+seurat_combined <- NormalizeData(seurat_combined)
+seurat_combined <- FindVariableFeatures(seurat_combined)
+seurat_combined <- ScaleData(seurat_combined)
+
+# PCA
+seurat_combined <- RunPCA(seurat_combined, npcs = 50)
+ElbowPlot(seurat_combined, ndims = 50)
+
+# UMAP & Clustering
+seurat_combined <- RunUMAP(seurat_combined, dims = 1:20)
+seurat_combined <- FindNeighbors(seurat_combined, dims = 1:20)
+seurat_combined <- FindClusters(seurat_combined, resolution = 0.8)
+
+DimPlot(seurat_combined, reduction = "umap", group.by = "FACSannotation", label = TRUE) + 
+  ggtitle("UMAP Projection")
+
+FeaturePlot(seurat_combined, features = "Mitf")
+
+# ------------------------------------------
+# 🔍 Subset Cells of Interest
+# ------------------------------------------
+Idents(seurat_combined) <- "FACSannotation"
+keep_cells <- c("NVFDC", "TUM", "VFDC")
+seurat_subset <- subset(seurat_combined, idents = keep_cells)
+
+DimPlot(seurat_subset, reduction = "umap", group.by = "FACSannotation", label = TRUE) +
+  ggtitle("Subset UMAP Projection")
+
+# Optionally save
+saveRDS(seurat_combined, "output/seurat_combined.rds")
+saveRDS(seurat_subset, "output/seurat_subset.rds")
