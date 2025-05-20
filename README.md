@@ -1,4 +1,4 @@
-# smartseq3-seurat-pipeline
+# Smartseq3-seurat-pipeline
 🧬 Pipeline Description
 This pipeline provides a complete preprocessing workflow for plate-based single-cell RNA sequencing (scRNA-seq) data generated using Smart-seq3. It is built in R using the Seurat package and is intended for researchers working with multi-plate Smart-seq3 data.
 
